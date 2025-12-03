@@ -1,0 +1,567 @@
+name: CICD
+
+on:
+  workflow_call:
+    inputs:
+      project:
+        required: true
+        type: string
+      branch_name:
+        required: true
+        type: string
+      github_env:
+        required: true
+        type: string
+        description: "This refers to the OIDC environment name"
+      branch_compact_name:
+        type: string
+        description: "eg: dev/101 will be dev101, for now only used in ACR without only accepts alphanumeric values. defaults to alphanumeric branch name"
+      branch_dash_name:
+        type: string
+        description: "eg: dev/101 will be 'dev-101'"
+
+    secrets:
+      client_id:
+        required: true
+      tenant_id:
+        required: true
+      subscription_id:
+        required: true
+      shared_env_subscription_id:
+        required: true
+      azure_mssql_connection_string:
+        required: true
+      azure_datalake_connection_string:
+        required: true
+env:
+  IMAGE_NAME: ${{ github.event.repository.name }}
+  GITHUB_TOKEN: ${{ secrets.TOKEN_GITHUB }}
+  CUSTOM_ENV_PREFIX: "APP_ENV_"
+  CUSTOM_ENV_BE_PREFIX: "BE_APP_ENV_"
+  CUSTOM_ENV_SHARED_PREFIX: "SHARED_APP_ENV_"
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  linting:
+    name: 'Linting'
+    uses: ./.github/workflows/be-lint.yml
+
+  derive-env:
+    runs-on: ubuntu-latest
+    outputs:
+      branch_dash_name: ${{ steps.setenv.outputs.branch_dash_name }}
+      env_compact: ${{ steps.setenv.outputs.env_compact }}
+    steps:
+      - name: Derive environment, prefix, and compact name
+        id: setenv
+        run: |
+          BRANCH_NAME="${{ inputs.branch_name }}"
+          ENV_DASH="${BRANCH_NAME//\//-}"
+          ENV_COMPACT="$(echo "$BRANCH_NAME" | tr -cd '[:alnum:]')"
+
+          if [ -n "${{ inputs.branch_compact_name }}" ]; then
+            FINAL_COMPACT="${{ inputs.branch_compact_name }}"
+          else
+            FINAL_COMPACT="$ENV_COMPACT"
+          fi
+
+          if [ -n "${{ needs.derive-env.outputs.branch_dash_name }}" ]; then
+            FINAL_DASH="${{ needs.derive-env.outputs.branch_dash_name }}"
+          else
+            FINAL_DASH="$ENV_DASH"
+          fi
+
+          {
+            echo "branch_name=$BRANCH_NAME"
+            echo "branch_dash_name=$FINAL_DASH"
+            echo "env_compact=$FINAL_COMPACT"
+          } >> "$GITHUB_OUTPUT"
+
+
+  cd:
+
+    name: "Azure Deployment to ${{inputs.branch_name}}"
+    runs-on: ubuntu-latest
+    needs: [
+      #      "linting",
+      "derive-env"
+    ]
+    environment: ${{ inputs.github_env }}
+    steps:
+      - name: 'Checkout Code'
+        uses: 'actions/checkout@v4'
+
+      - name: Get ENVS from Output
+        run: |
+          echo branch_name: ${{ inputs.branch_name }}
+          echo github_env: ${{ inputs.github_env }}
+          echo branch_dash_name: ${{ needs.derive-env.outputs.branch_dash_name }}
+          echo env_compact: ${{ needs.derive-env.outputs.env_compact }}
+      - name: Repo Name to Subdomain
+        id: short_name
+        run: |
+          declare -A repo_map=(
+            [test-service]="test"
+          )
+
+          input_short_name="${{ inputs.shortName }}"
+          if [ -n "$input_short_name" ]; then
+            echo "shortName=$input_short_name" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          repo="${{ github.event.repository.name }}"
+          if [[ -n "${repo_map[$repo]}" ]]; then
+            echo "shortName=${repo_map[$repo]}" >> $GITHUB_OUTPUT
+          else
+            echo "Error: Unknown repository '$repo'. Please define a shortName or update the map." >&2
+            exit 1
+          fi
+
+      - name: "Azure Login with OIDC with env: ${{ inputs.github_env }}"
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.client_id }}
+          tenant-id: ${{ secrets.tenant_id }}
+          subscription-id: ${{ secrets.subscription_id }}
+          allow-no-subscriptions: true
+
+      - name: Debug current account
+        run: |
+          echo "=== Azure Account Context ==="
+          az account show --output table
+          echo "=== List all subscriptions visible to SP ==="
+          subs=$(az account list --query "length([])" -o tsv)
+          echo "Total subscriptions: $subs"
+          if [ "$subs" -le 1 ]; then
+            echo "❌ Only one subscription detected. Expected more."
+            exit 1
+          fi
+          az account list --output table
+
+
+      - name: Load and Source KVs to ENV
+        run: |
+          PREFIX="${{env.CUSTOM_ENV_PREFIX}}"
+          BE_PREFIX="${{env.CUSTOM_ENV_BE_PREFIX}}"
+          SHARED_PREFIX="${{env.CUSTOM_ENV_SHARED_PREFIX}}"
+
+          URLS_VAULT="myproject-urls-${{ needs.derive-env.outputs.branch_dash_name }}"
+          BE_VAULT="myproject-be-${{ needs.derive-env.outputs.branch_dash_name }}"
+          SHARED_VAULT="myproject-be-shared-${{ inputs.github_env }}"
+          SHARED_SUBSCRIPTION_ID="${{ secrets.shared_env_subscription_id }}"
+
+          echo "Loading secret *references* from $URLS_VAULT (excluding SQAI-XFULL-*)..."
+
+          # Export env vars as secret references: APP_ENV_<NAME_WITH_UNDERSCORES>=secretref:<original-secret-name>
+          while IFS= read -r NAME; do
+            ENV_NAME=${NAME//-/_}            # SQAI-ALERTS-API -> SQAI_ALERTS_API
+            ENV_NAME="${PREFIX}${ENV_NAME}"  # add prefix
+            echo "${ENV_NAME}=${NAME}" >> "$GITHUB_ENV"
+            # export "${ENV_NAME}=${NAME}"
+            echo "referenced $ENV_NAME"
+          done < <(az keyvault secret list \
+          --vault-name "$URLS_VAULT" \
+          --query "[].name" -o tsv | grep '^SQAI-' | grep -v '^SQAI-XFULL-')
+
+          while IFS= read -r NAME; do
+            ENV_NAME=${NAME//-/_}
+            ENV_NAME="${BE_PREFIX}${ENV_NAME}"  # add prefix
+            echo "${ENV_NAME}=${NAME}" >> "$GITHUB_ENV"
+            # export "${ENV_NAME}=${NAME}"
+            echo "referenced $ENV_NAME"
+          done < <(az keyvault secret list \
+          --vault-name "$BE_VAULT" \
+          --query "[].name" -o tsv)
+
+          echo "✅ Environment now contains secret *references* for ${PREFIX}SQAI_* (except ${PREFIX}SQAI_XFULL_*)."
+
+          echo "Loading SHARED secret *references* from $SHARED_VAULT (subscription: $SHARED_SUBSCRIPTION_ID)..."
+
+          while IFS= read -r NAME; do
+            ENV_NAME=${NAME//-/_}
+            ENV_NAME="${SHARED_PREFIX}${ENV_NAME}"
+             echo "${ENV_NAME}=${NAME}" >> "$GITHUB_ENV"
+            # export "${ENV_NAME}=${NAME}"
+            echo "referenced $ENV_NAME"
+          done < <(az keyvault secret list \
+          --id "https://${SHARED_VAULT}.vault.azure.net" \
+          --subscription "$SHARED_SUBSCRIPTION_ID" \
+          --query "[].name" -o tsv)
+
+          echo "✅ Environment now contains secret *references* from both vaults."
+
+
+
+      - name: Check if APP_ENV and SHARED_APP_ENV_EMAIL_DONOT_REPLY is exported properly
+        run: |
+          echo "SHARED_APP_ENV_EMAIL_DONOT_REPLY --> ${SHARED_APP_ENV_EMAIL_DONOT_REPLY}"
+          echo "APP_ENV_SQAI_WORKLOAD_API --> ${APP_ENV_SQAI_WORKLOAD_API}"
+
+          if [ -z "${SHARED_APP_ENV_EMAIL_DONOT_REPLY}" ] || [ -z "${APP_ENV_SQAI_WORKLOAD_API}" ]; then
+            echo "❌ One or more required environment variables are missing!"
+            exit 1
+          else
+            echo "✅ All environment variables are set properly."
+          fi
+
+
+      - name: Generate application.yml
+        run: |
+              PREFIX="${{env.CUSTOM_ENV_PREFIX}}"
+              BE_PREFIX="${{env.CUSTOM_ENV_BE_PREFIX}}"
+              SHARED_PREFIX="${{env.CUSTOM_ENV_SHARED_PREFIX}}"
+              OUTPUT="application.yml"
+              DB_NAME="sqldb-main-${{ needs.derive-env.outputs.branch_dash_name }}"
+              DB_DATALAKE_NAME="sqldb-datalake-shared-${{ inputs.github_env }}"
+              BUILD_TIME_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+              BUILD_TIME_PH=$(TZ=Asia/Manila date +%Y-%m-%dT%H:%M:%S%z)
+              BUILD_TIME_UK=$(TZ=Europe/London date +%Y-%m-%dT%H:%M:%S%z)
+
+              API_HOST_VAR="${PREFIX}SQAI_API_HOSTNAME"
+              API_HOST_ENV_NAME="${API_HOST_VAR//-/_}"
+
+              HOST_VAR="${PREFIX}SQAI_HOSTNAME"
+              HOST_ENV_NAME="${HOST_VAR//-/_}"
+
+
+              cat > "$OUTPUT" <<YAML
+              spring:
+                datasource:
+                  url: jdbc:sqlserver://\${${BE_PREFIX}MSSQL_SERVER_NAME}.database.windows.net:1433;database=${DB_NAME};user=\${${BE_PREFIX}MSSQL_LOGIN};password=\${${BE_PREFIX}MSSQL_PASSWORD};encrypt=true;trustServerCertificate=false;loginTimeout=30;
+                  driver-class-name: com.microsoft.sqlserver.jdbc.SQLServerDriver
+                jpa:
+                  database-platform: org.hibernate.dialect.SQLServerDialect
+                  hibernate:
+                    ddl-auto: update
+                session:
+                  store-type: jdbc
+                  jdbc:
+                    initialize-schema: always
+                    table-name: SPRING_SESSION
+                security:
+                  oauth2:
+                    resourceserver:
+                      jwt:
+                        issuer-uri: \${${SHARED_PREFIX}JWT_ISSUER_URI}
+                        jwk-set-uri: \${${SHARED_PREFIX}JWT_SET_ISSUER_URI}
+              server:
+                port: 8080
+                servlet:
+                  session:
+                    timeout: 30m
+
+              app:
+                environment:
+                  name: ${{ needs.derive-env.outputs.branch_dash_name }}
+
+              azure:
+                applicationinsights:
+                  instrumentation-key: \${${SHARED_PREFIX}APPINSIGHTS_INSTRUMENTATIONKEY}
+                storage:
+                  datalake:
+                    connection-string: DefaultEndpointsProtocol=https;AccountName=\${${BE_PREFIX}DATALAKE_NAME};AccountKey=\${${BE_PREFIX}DATALAKE_ACCESS_KEY};EndpointSuffix=core.windows.net
+                    container-name: databricks-weather-data
+                    folder-name: weather-data-daily
+                    file-name: weather-data
+              dashboard:
+                base-url: \${${HOST_ENV_NAME}}
+              api:
+                base-url: \${${API_HOST_ENV_NAME}}
+                services:
+              YAML
+
+              # Only pick *_API vars, exclude the hostname and XFULL
+              for NAME in $(env | awk -F= '{print $1}' \
+                | grep "^${PREFIX}SQAI_" \
+                | grep "_API$" \
+                | grep -v "^${PREFIX}SQAI_XFULL_"); do
+
+                # NAME example: APP_ENV_SQAI_GMAPS_API
+                SERVICE_KEY=$(echo "$NAME" \
+                  | sed -E "s/^${PREFIX}SQAI_//" \
+                  | sed -E "s/_API$//" \
+                  | tr 'A-Z_' 'a-z-' \
+                )
+
+                PATH_VAR="${NAME//-/_}"
+
+                echo "    ${SERVICE_KEY}:" >> "$OUTPUT"
+                echo "      base-url: \${${HOST_ENV_NAME}}" >> "$OUTPUT"
+                echo "      path: \${${PATH_VAR}}" >> "$OUTPUT"
+                echo "      full-url: \${${HOST_ENV_NAME}}\${${PATH_VAR}}" >> "$OUTPUT"
+              done
+
+              cat >> "$OUTPUT" <<YAML
+
+              external:
+                internal-api:
+                  base-url: \${${SHARED_PREFIX}INTERNAL_API}
+                  token: \${${SHARED_PREFIX}INTERNAL_TOKEN}
+                  email:
+                    batch-size: 50
+                    send-email: /api/send-email
+                    sender-address: \${${SHARED_PREFIX}EMAIL_DONOT_REPLY}
+                  sms:
+                    send-sms: /api/send-sms
+                aftership:
+                  base-url: \${${SHARED_PREFIX}EXTERNAL_AFTERSHIP_API}
+                  api-key: \${${SHARED_PREFIX}AFTERSHIP_API_KEY}
+                national-highway:
+                  base-url: \${${SHARED_PREFIX}NATIONAL_HIGHWAY_API}
+                  api-key: \${${SHARED_PREFIX}NATIONAL_HIGHWAY_API_KEY}
+                google:
+                  directions:
+                    base-url: https://maps.googleapis.com/maps/api/directions/json
+                    default-params: "%s?origin=%s&destination=%s&alternatives=true&departure_time=now&key=%s"
+                  maps:
+                    api-key: \${${SHARED_PREFIX}GMAPS_API_KEY}
+                metoffice:
+                  base-url: https://data.hub.api.metoffice.gov.uk/sitespecific/v0/point/
+                  api-key: \${${SHARED_PREFIX}WEATHER_API_KEY}
+
+              management:
+                endpoint:
+                  health:
+                    show-details: always
+                health:
+                  defaults:
+                    enabled: false
+                  build:
+                    enabled: true
+
+              actuator:
+                env:
+                  vars:
+                    git:
+                      hash: ${GITHUB_SHA::7}
+                    build:
+                      time:
+                        utc: ${BUILD_TIME_UTC}
+                        ph: ${BUILD_TIME_PH}
+                        uk: ${BUILD_TIME_UK}
+
+              logging:
+                pattern:
+                  console: "%d{yyyy-MM-dd HH:mm:ss} - %msg%n"
+
+              sentry:
+                dsn: \${${SHARED_PREFIX}SENTRY_DSN}
+                send-default-pii: true
+                environment: ${{ needs.derive-env.outputs.branch_dash_name }}
+                release: ${GITHUB_SHA::7}
+
+              YAML
+
+              echo "✅ Generated $OUTPUT"
+              cat "$OUTPUT"
+              # overwrite and delete other application config
+
+              # Fail if application.yml already exists
+              if [ -f src/main/resources/application.yml ]; then
+                echo "❌ src/main/resources/application.yml already exists. Exiting to avoid overwrite and data leaks."
+                exit 1
+              fi
+
+              mv $OUTPUT src/main/resources
+              if [ ! -f src/main/resources/application.yml ]; then
+                echo "❌ Failed to move $OUTPUT to src/main/resources/application.yml"
+                echo "Make sure to add src/main/resources/.gitkeep file if src/main/resources is empty."
+                exit 1
+              fi
+
+              rm -f src/main/resources/application.properties
+              ls -la src/main/resources
+
+
+
+
+      - name: Set Additional ENV
+        run: |
+          echo "ACR_NAME=acr${{ inputs.project }}serverless${{ needs.derive-env.outputs.env_compact }}" >> $GITHUB_ENV
+          echo "RESOURCE_GROUP=rg-${{ inputs.project }}-serverless-${{ needs.derive-env.outputs.branch_dash_name }}" >> $GITHUB_ENV
+
+      - name: Get User Managed ID Main
+        id: get_uami
+        run: |
+          UAMI_ID=$(az identity show \
+          -g "rg-myproject-security-${{ needs.derive-env.outputs.branch_dash_name }}" \
+          -n "id-myproject-security-${{ needs.derive-env.outputs.branch_dash_name }}" \
+          --subscription "${{ secrets.subscription_id }}" \
+          --query id -o tsv)
+          # echo "::add-mask::$UAMI_ID"
+          echo "UAMI=$UAMI_ID" >> "$GITHUB_ENV"
+          echo "uami=$UAMI_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Get User Managed ID Shared
+        id: get_uami_shared
+        run: |
+          UAMI_ID_SHARED=$(az identity show \
+          -g "rg-myproject-security-shared-${{ inputs.github_env }}" \
+          -n "id-myproject-security-shared-${{ inputs.github_env }}" \
+          --subscription "${{ secrets.shared_env_subscription_id }}" \
+          --query id -o tsv)
+          # echo "::add-mask::UAMI_ID_SHARED"
+          echo "UAMI_SHARED=$UAMI_ID_SHARED" >> "$GITHUB_ENV"
+          echo "uami_shared=$UAMI_ID_SHARED" >> "$GITHUB_OUTPUT"
+
+      - name: Login to ACR with AAD token
+        run: |
+          ACR_NAME=${{ env.ACR_NAME }}
+          az acr login --name $ACR_NAME
+
+      - name: Set ACR Tag
+        run: echo "ACR_TAG=${{ env.ACR_NAME }}.azurecr.io/${{ inputs.github_env }}/${{ steps.short_name.outputs.shortName }}:${{ github.sha }}" >> $GITHUB_ENV
+
+      - name: Load SENTRY_AUTH_TOKEN from Key Vault
+        id: kv_sentry
+        run: |
+          SHARED_VAULT="myproject-be-shared-${{ inputs.github_env }}"
+
+          token=$(az keyvault secret show \
+            --vault-name "$SHARED_VAULT" \
+            --name "SENTRY-AUTH-TOKEN" \
+            --query value -o tsv)
+
+          if [ -z "$token" ]; then
+            echo "ERROR: Failed to retrieve SENTRY-AUTH-TOKEN from $SHARED_VAULT"
+            exit 1
+          fi
+
+          echo "::add-mask::$token"
+          echo "SENTRY_AUTH_TOKEN=$token" >> "$GITHUB_ENV"
+
+
+      - name: Build and Push to ACR
+        uses: docker/build-push-action@v6
+        id: acr
+        env:
+          BUILDKIT_PROGRESS: quiet
+        with:
+          context: .
+          push: true
+          tags: ${{ env.ACR_TAG }}
+          build-args: |
+            SENTRY_AUTH_TOKEN=${{ env.SENTRY_AUTH_TOKEN }}
+
+      - name: Use ACR Tag
+        run: |
+          echo "Using ACR tag: ${{ env.ACR_TAG }}"
+
+      - name: Ensure Container App Extension is Installed
+        run: |
+          echo "🔍 Checking if 'containerapp' extension is installed..."
+          if az extension show --name containerapp &>/dev/null; then
+            echo "✅ 'containerapp' extension is already installed. Upgrading..."
+            az extension update --name containerapp
+          else
+            echo "📦 Installing 'containerapp' extension..."
+            az extension add --name containerapp
+          fi
+
+      - name: Display Azure CLI Extensions
+        run: |
+          echo "📦 Installed Azure CLI extensions:"
+          az extension list --output table
+
+      - name: Deploy to Azure Container App
+        run: |
+          RESOURCE_GROUP=${{ env.RESOURCE_GROUP }}
+          CA_NAME=ca-${{ steps.short_name.outputs.shortName }}-${{ needs.derive-env.outputs.branch_dash_name }}
+          TAG=${{ env.ACR_TAG }}
+
+          UAMI=${{ env.UAMI }}
+          UAMI_SHARED=${{ env.UAMI_SHARED }}
+          #
+          PREFIX="${{env.CUSTOM_ENV_PREFIX}}"
+          BE_PREFIX="${{env.CUSTOM_ENV_BE_PREFIX}}"
+          SHARED_PREFIX="${{env.CUSTOM_ENV_SHARED_PREFIX}}"
+          URLS_VAULT="myproject-urls-${{ needs.derive-env.outputs.branch_dash_name }}"
+          BE_VAULT="myproject-be-${{ needs.derive-env.outputs.branch_dash_name }}"
+          SHARED_VAULT="myproject-be-shared-${{ inputs.github_env }}"
+
+          BASE_ENV="GIT_HASH=${GITHUB_SHA::7} \
+          BUILD_TIME_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+          BUILD_TIME_PH=$(TZ=Asia/Manila date +%Y-%m-%dT%H:%M:%S%z) \
+          BUILD_TIME_UK=$(TZ=Europe/London date +%Y-%m-%dT%H:%M:%S%z)"
+
+          # URL SECRETS
+          KV_ENVS=""
+          while IFS='=' read -r K V; do
+            [ -n "$V" ] || continue
+            V_LOWER=$(echo "$K" | tr '[:upper:]' '[:lower:]' | tr '_' '-')
+            KV_ENVS+="${K}=secretref:${V_LOWER} "
+          done < <(
+            {
+              env | grep "^${PREFIX}"
+              env | grep "^${BE_PREFIX}"
+            }
+          )
+
+          KV_ENVS_SHARED=""
+          while IFS='=' read -r K V; do
+            [ -n "$V" ] || continue
+            V_LOWER=$(echo "$K" | tr '[:upper:]' '[:lower:]' | tr '_' '-')
+            KV_ENVS_SHARED+="${K}=secretref:${V_LOWER} "
+          done < <(env | grep "^${SHARED_PREFIX}")
+
+          #----
+
+          SECRET_ENVS=""
+          while IFS='=' read -r K V; do
+            [ -n "$V" ] || continue
+            K_LOWER=$(echo "$K" | tr '[:upper:]' '[:lower:]' | tr '_' '-')
+            SECRET_ENVS+="${K_LOWER}=keyvaultref:https://${URLS_VAULT}.vault.azure.net/secrets/${V},identityref:${UAMI} "
+          done < <(
+            {
+              env | grep "^${PREFIX}"
+            }
+          )
+
+          while IFS='=' read -r K V; do
+            [ -n "$V" ] || continue
+            K_LOWER=$(echo "$K" | tr '[:upper:]' '[:lower:]' | tr '_' '-')
+            SECRET_ENVS+="${K_LOWER}=keyvaultref:https://${BE_VAULT}.vault.azure.net/secrets/${V},identityref:${UAMI} "
+          done < <(
+            {
+              env | grep "^${BE_PREFIX}"
+            }
+          )
+
+          SHARED_SECRET_ENVS=""
+          while IFS='=' read -r K V; do
+            [ -n "$V" ] || continue
+            K_LOWER=$(echo "$K" | tr '[:upper:]' '[:lower:]' | tr '_' '-')
+            SHARED_SECRET_ENVS+="${K_LOWER}=keyvaultref:https://${SHARED_VAULT}.vault.azure.net/secrets/${V},identityref:${UAMI_SHARED} "
+          done < <(env | grep "^${SHARED_PREFIX}")
+
+          # echo "SECRET_ENVS : ${SECRET_ENVS}"
+          # echo "SHARED_SECRET_ENVS : ${SHARED_SECRET_ENVS}"
+          # echo "---"
+          # echo "BASE_ENV : ${BASE_ENV}"
+          # echo "KV_ENVS : ${KV_ENVS}"
+          # echo "KV_ENVS_SHARED : ${KV_ENVS_SHARED}"
+          #
+
+          az containerapp identity assign \
+           --name "${CA_NAME}" \
+           --resource-group "${RESOURCE_GROUP}" \
+           --user-assigned "${UAMI_SHARED}"
+
+          az containerapp secret set --name "${CA_NAME}" --resource-group "${RESOURCE_GROUP}" --secrets ${SECRET_ENVS} ${SHARED_SECRET_ENVS}
+
+          ## weird azure bug, don't remove ">/dev/null 2>&1 || true"
+          az containerapp registry set \
+            --name "${CA_NAME}" \
+            --resource-group "${RESOURCE_GROUP}" \
+            --server "${{ env.ACR_NAME }}.azurecr.io" \
+            --identity "${UAMI}" >/dev/null 2>&1 || true
+
+          az containerapp update \
+            --name "${CA_NAME}" \
+            --resource-group "${RESOURCE_GROUP}" \
+            --image "${TAG}" \
+            --set-env-vars ${BASE_ENV} ${KV_ENVS} ${KV_ENVS_SHARED}

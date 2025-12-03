@@ -1,0 +1,43 @@
+name: Sprint Boot Lint
+
+permissions:
+  id-token: write
+  contents: read
+
+on:
+  workflow_call:
+
+jobs:
+  linting:
+    name: 'Linting for Spring Boot'
+    runs-on: 'ubuntu-latest'
+    steps:
+
+      - name: 'Checkout Code'
+        if: steps.detect_java.outputs.has_java == 'true'
+        uses: 'actions/checkout@v4'
+
+      - name: "Detect Java project"
+        id: detect_java
+        run: |
+          if [[ -f "pom.xml" || -f "build.gradle" || -f "build.gradle.kts" ]]; then
+            echo "has_java=true" >> $GITHUB_OUTPUT
+          else
+            echo "No Java build file found. Skipping lint..."
+            echo "has_java=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 'Set up JDK 21'
+        if: steps.detect_java.outputs.has_java == 'true'
+
+        uses: 'actions/setup-java@v4'
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      # checkstyle.xml must be from the root folder of the caller workflow
+      - name: 'Install Checkstyle and Run'
+        if: steps.detect_java.outputs.has_java == 'true'
+        run: |
+          curl -LJO https://github.com/checkstyle/checkstyle/releases/download/checkstyle-10.12.1/checkstyle-10.12.1-all.jar
+          java -jar checkstyle-10.12.1-all.jar -c checkstyle.xml src

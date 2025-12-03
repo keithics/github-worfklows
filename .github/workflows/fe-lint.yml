@@ -1,0 +1,23 @@
+name: NPM Lint
+
+permissions:
+  id-token: write
+  contents: read
+
+on:
+  workflow_call:
+
+jobs:
+  linting:
+    name: 'Linting'
+    runs-on: 'ubuntu-latest'
+    steps:
+      - name: 'Checkout Code'
+        uses: 'actions/checkout@v2'
+
+      - name: 'Lint code'
+        env:
+          GITHUB_TOKEN: ${{ secrets.TOKEN_GITHUB }}
+        run: |
+          npm ci
+          npm run lint

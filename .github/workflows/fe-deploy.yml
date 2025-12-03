@@ -1,0 +1,257 @@
+name: FE React CICD
+
+on:
+  workflow_call:
+    inputs:
+      project:
+        required: true
+        type: string
+      branch_name:
+        required: true
+        type: string
+      github_env:
+        required: true
+        type: string
+        description: "This refers to the OIDC environment name"
+      branch_compact_name:
+        type: string
+        description: "eg: dev/101 will be dev101, for now only used in ACR without only accepts alphanumeric values. defaults to alphanumeric branch name"
+      branch_dash_name:
+        type: string
+        description: "eg: dev/101 will be 'dev-101'"
+
+    secrets:
+      client_id:
+        required: true
+      tenant_id:
+        required: true
+      subscription_id:
+        required: true
+      shared_env_subscription_id:
+        required: true
+      cloudflare_api_token:
+        required: true
+      cloudflare_account_id:
+        required: true
+env:
+  IMAGE_NAME: ${{ github.event.repository.name }}
+  GITHUB_TOKEN: ${{ secrets.TOKEN_GITHUB }}
+  CUSTOM_ENV_PREFIX: "APP_ENV_"
+  CUSTOM_ENV_SHARED_PREFIX: "SHARED_APP_ENV_"
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  linting:
+    name: 'Linting'
+    uses: ./.github/workflows/fe-lint.yml
+  derive-env:
+    runs-on: ubuntu-latest
+    outputs:
+      branch_dash_name: ${{ steps.setenv.outputs.branch_dash_name }}
+      env_compact: ${{ steps.setenv.outputs.env_compact }}
+    steps:
+      - name: Derive environment, prefix, and compact name
+        id: setenv
+        run: |
+          BRANCH_NAME="${{ inputs.branch_name }}"
+          ENV_DASH="${BRANCH_NAME//\//-}"
+          ENV_COMPACT="$(echo "$BRANCH_NAME" | tr -cd '[:alnum:]')"        
+          
+          if [ -n "${{ inputs.branch_compact_name }}" ]; then
+            FINAL_COMPACT="${{ inputs.branch_compact_name }}"
+          else
+            FINAL_COMPACT="$ENV_COMPACT"
+          fi
+          
+          if [ -n "${{ needs.derive-env.outputs.branch_dash_name }}" ]; then
+            FINAL_DASH="${{ needs.derive-env.outputs.branch_dash_name }}"
+          else
+            FINAL_DASH="$ENV_DASH"
+          fi
+          
+          {
+            echo "branch_name=$BRANCH_NAME"
+            echo "branch_dash_name=$FINAL_DASH"
+            echo "env_compact=$FINAL_COMPACT"
+          } >> "$GITHUB_OUTPUT"
+
+
+  build:
+    runs-on: ubuntu-latest
+    needs: [
+      "linting",
+      "derive-env"
+    ]
+    environment: ${{ inputs.github_env }}
+    outputs:
+      env_prefix: ${{ needs.derive-env.outputs.env_prefix }}
+
+    steps:
+      - name: Checkout code
+        uses: 'actions/checkout@v4'
+
+      - name: Get ENVS from Output
+        run: |
+          echo branch_name: ${{ inputs.branch_name }}
+          echo github_env: ${{ inputs.github_env }}
+          echo branch_dash_name: ${{ needs.derive-env.outputs.branch_dash_name }}
+          echo env_compact: ${{ needs.derive-env.outputs.env_compact }}
+
+      - name: Set up Node.js 22.11.0
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.11.0'
+
+      - name: "Azure Login with OIDC with env: ${{ inputs.github_env }}"
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.client_id }}
+          tenant-id: ${{ secrets.tenant_id }}
+          subscription-id: ${{ secrets.subscription_id }}
+          allow-no-subscriptions: true
+
+      - name: Debug current account
+        run: |
+          echo "=== Azure Account Context ==="
+          az account show --output table
+          echo "=== List all subscriptions visible to SP ==="
+          subs=$(az account list --query "length([])" -o tsv)
+          echo "Total subscriptions: $subs"
+          if [ "$subs" -le 1 ]; then
+            echo "❌ Only one subscription detected. Expected more."
+            exit 1
+          fi
+          az account list --output table
+
+      - name: Construct Key Vault name
+        id: kv
+        run: |
+          echo "kv_name=pulse-urls-${{ needs.derive-env.outputs.branch_dash_name }}" >> $GITHUB_OUTPUT
+          echo "kv_name_shared=pulse-fe-shared-${{ inputs.github_env }}" >> $GITHUB_OUTPUT
+
+      - name: Download secrets from Azure Key Vault
+        run: |
+          set -e
+          echo "" > .env
+          KV_NAME="${{ steps.kv.outputs.kv_name }}"
+          KV_NAME_SHARED="${{ steps.kv.outputs.kv_name_shared }}"
+          SHARED_SUBSCRIPTION_ID="${{ secrets.shared_env_subscription_id }}"
+
+          echo "🔍 Checking if Key Vault '$KV_NAME' exists..."
+          if ! az keyvault show --name "$KV_NAME" &>/dev/null; then
+            echo "Key Vault '$KV_NAME' not found. Check project/environment inputs or Azure permissions."
+            exit 1
+          fi
+
+          echo "🔍 Checking if shared Key Vault '$KV_NAME_SHARED' exists..."
+          if ! az keyvault show --name "$KV_NAME_SHARED" --subscription "$SHARED_SUBSCRIPTION_ID" &>/dev/null; then
+            echo "Shared Key Vault '$KV_NAME_SHARED' not found."
+            exit 1
+          fi
+
+          echo "Fetching secrets from '$KV_NAME'..."
+          secrets=$(az keyvault secret list --vault-name "$KV_NAME" --query "[].name" -o tsv)
+
+          if [ -z "$secrets" ]; then
+            echo "No secrets found in Shared Key Vault '$KV_NAME'."
+            exit 1
+          fi
+
+          for secret_name in $secrets; do
+            secret_value=$(az keyvault secret show --vault-name "$KV_NAME" --name "$secret_name" --query "value" -o tsv)
+            echo "::add-mask::$secret_value"
+            # Transform secret name
+            env_name="${secret_name//-/_}"     # replace - with _
+            env_name="${env_name//SQAI/VITE}"  # replace SQAI with VITE          
+            echo "$env_name=$secret_value" >> .env
+          done
+
+          echo "Fetching shared secrets from '$KV_NAME_SHARED'..."
+          shared_secrets=$(az keyvault secret list --vault-name "$KV_NAME_SHARED" --subscription "$SHARED_SUBSCRIPTION_ID" --query "[].name" -o tsv)
+          for secret_name in $shared_secrets; do
+            secret_value=$(az keyvault secret show --vault-name "$KV_NAME_SHARED" --subscription "$SHARED_SUBSCRIPTION_ID" --name "$secret_name" --query "value" -o tsv)
+            echo "::add-mask::$secret_value"
+          
+            # Transform secret name
+            env_name="${secret_name//-/_}"     # replace - with _
+            env_name="${env_name//SQAI/VITE}"  # replace SQAI with VITE    
+          
+            echo "$env_name=$secret_value" >> .env
+          done
+
+          echo "✅ .env file created with secrets from both vaults."
+          cat .env
+          ls -l .env
+          head -n 5 .env | sed 's/=.*/=***MASKED***/'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build the React app
+        run: |
+          export VITE_RELEASE="${GITHUB_SHA::7}"
+          export VITE_ENVIRONMENT="${{ needs.derive-env.outputs.branch_dash_name }}"
+          npm run build
+
+      - name: Generate health-check.html
+        run: |
+          set -euo pipefail
+          mkdir -p ./dist
+
+          SHORT_SHA="${GITHUB_SHA::7}"
+          BUILD_TIME_UTC="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          BUILD_TIME_PH="$(TZ=Asia/Manila date +'%Y-%m-%d %I:%M %p PH')"
+          BUILD_TIME_UK="$(TZ=Europe/London date +'%Y-%m-%d %I:%M %p UK')"
+
+          cat > ./dist/health-check.html <<EOF
+          <!doctype html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8" />
+            <meta name="robots" content="noindex,nofollow,noarchive" />
+            <title>health-check</title>
+          </head>
+          <body>
+            <pre id="hc"></pre>
+            <script>
+              const data = {
+                status: "ok",
+                commit: "${SHORT_SHA}",
+                buildTimeUTC: "${BUILD_TIME_UTC}",
+                buildTimePH: "${BUILD_TIME_PH}",
+                buildTimeUK: "${BUILD_TIME_UK}"
+              };
+              document.getElementById("hc").textContent = JSON.stringify(data, null, 2);
+            </script>
+          </body>
+          </html>
+          EOF
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: react-dist
+          path: ./dist
+
+  deploy-cf-pages:
+    runs-on: ubuntu-latest
+    needs: ["build","derive-env"]
+    environment: dev
+
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: react-dist
+          path: ./dist
+
+      - name: Deploy to CF Pages
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.cloudflare_api_token }}
+          accountId: ${{ secrets.cloudflare_account_id }}
+          command: pages deploy ./dist --project-name=pulse-${{ needs.derive-env.outputs.branch_dash_name }} --branch=${{ github.ref_name }}
+          gitHubToken: ${{ secrets.TOKEN_GITHUB }}

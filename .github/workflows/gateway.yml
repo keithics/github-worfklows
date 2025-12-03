@@ -1,0 +1,166 @@
+name: BE Router (single entry)
+
+on:
+  workflow_call:
+    inputs:
+      project:
+        required: true
+        type: string
+      branch_name:
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+### Get OIDC credentials based on the branch, for both FE and BE
+  get-secrets:
+    name: "Resolve secret names from branch"
+    runs-on: ubuntu-latest
+
+    outputs:
+      client_id_secret: ${{ steps.map.outputs.client_id_secret }}
+      tenant_id_secret: ${{ steps.map.outputs.tenant_id_secret }}
+      subscription_id_secret: ${{ steps.map.outputs.subscription_id_secret }}
+      shared_env_subscription_id_secret: ${{ steps.map.outputs.shared_env_subscription_id_secret }}
+    steps:
+      - id: map
+        shell: bash
+        run: |
+          BRANCH="${{ inputs.branch_name }}"
+
+          if [[ "$BRANCH" == "dev/pulse" ]]; then
+            CLIENT_ID_SECRET="AZURE_OIDC_CLIENTID_DEV_PULSE"
+            TENANT_ID_SECRET="AZURE_OIDC_TENANTID_DEV"
+            SUBSCRIPTION_ID_SECRET="AZURE_SUBSCRIPTION_ID_DEV"
+            SHARED_ENV_SUBSCRIPTION_ID_SECRET="AZURE_SHARED_SUBSCRIPTION_ID_SDC"
+
+          else
+            echo "Unknown branch '$BRANCH'. Expected branch to start with 'dev/stg/prod'."
+            exit 1
+          fi
+
+          {
+            echo "client_id_secret=$CLIENT_ID_SECRET"
+            echo "tenant_id_secret=$TENANT_ID_SECRET"
+            echo "subscription_id_secret=$SUBSCRIPTION_ID_SECRET"
+            echo "shared_env_subscription_id_secret=$SHARED_ENV_SUBSCRIPTION_ID_SECRET"
+          } >> "$GITHUB_OUTPUT"
+
+
+  determine-env:
+    name: Determine environment from branch
+    runs-on: ubuntu-latest
+    outputs:
+      github_env: ${{ steps.determine-env-step.outputs.env }}
+    steps:
+      - name: Detect env from branch
+        id: determine-env-step
+        run: |
+          BRANCH="${{ inputs.branch_name }}"
+  
+          if [[ "$BRANCH" == dev* ]]; then
+            ENV="dev"
+          elif [[ "$BRANCH" == stg* ]]; then
+            ENV="stg"
+          elif [[ "$BRANCH" == prod* ]]; then
+            ENV="prod"
+          else
+            echo "Unknown environment prefix in branch: $BRANCH"
+            exit 1
+          fi
+  
+          echo "env=$ENV" >> "$GITHUB_OUTPUT"
+
+
+## Dashboard Pipelines ###
+
+  ### Get CF secrets based on the branch
+  get-cloudflare-secrets:
+    name: "Get Cloudflare secrets"
+    if: endsWith(github.event.repository.name, '-dashboard')
+    runs-on: ubuntu-latest
+    outputs:
+      cloudflare_api_token: ${{ steps.map.outputs.cloudflare_api_token }}
+      cloudflare_account_id: ${{ steps.map.outputs.cloudflare_account_id }}
+    steps:
+      - id: map
+        shell: bash
+        run: |
+          BRANCH="${{ inputs.branch_name }}"
+
+          if [[ "$BRANCH" == dev* ]]; then
+            CLOUDFLARE_API_TOKEN="CLOUDFLARE_API_TOKEN_DEV"
+            CLOUDFLARE_ACCOUNT_ID="CLOUDFLARE_ACCOUNT_ID_DEV"
+          
+          elif [[ "$BRANCH" == stg* ]]; then
+            CLOUDFLARE_API_TOKEN="CLOUDFLARE_API_TOKEN_DEV"
+            CLOUDFLARE_ACCOUNT_ID="CLOUDFLARE_ACCOUNT_ID_DEV"
+
+          elif [[ "$BRANCH" == prod* ]]; then
+            CLOUDFLARE_API_TOKEN="AZURE_OIDC_CLIENTID_PROD"
+            CLOUDFLARE_ACCOUNT_ID="AZURE_OIDC_TENANTID_PROD"
+
+          else
+            echo "Unknown branch '$BRANCH'. Expected branch to start with 'dev/test/staging/prod'."
+            exit 1
+          fi
+
+          {
+            echo "cloudflare_api_token=$CLOUDFLARE_API_TOKEN"
+            echo "cloudflare_account_id=$CLOUDFLARE_ACCOUNT_ID"
+          } >> "$GITHUB_OUTPUT"
+  fe-dev:
+    name: "Deploying to FE Development"
+    needs: ["get-secrets","get-cloudflare-secrets", "determine-env"]
+    if: endsWith(github.event.repository.name, '-dashboard')
+    uses: ./.github/workflows/fe-deploy.yml
+    with:
+      project: ${{ inputs.project }}
+      branch_name: ${{ inputs.branch_name }}
+      github_env: ${{ needs.determine-env.outputs.github_env }}
+    secrets:
+      client_id: ${{ secrets[needs.get-secrets.outputs.client_id_secret] }}
+      tenant_id: ${{ secrets[needs.get-secrets.outputs.tenant_id_secret] }}
+      subscription_id: ${{ secrets[needs.get-secrets.outputs.subscription_id_secret] }}
+      shared_env_subscription_id: ${{ secrets[needs.get-secrets.outputs.shared_env_subscription_id_secret] }}
+      cloudflare_api_token: ${{ secrets[needs.get-cloudflare-secrets.outputs.cloudflare_api_token] }}
+      cloudflare_account_id: ${{ secrets[needs.get-cloudflare-secrets.outputs.cloudflare_account_id] }}
+
+## BE Pipelines ###
+
+
+  be-dev:
+    name: "Deploying to BE Development"
+    needs: ["get-secrets", "determine-env"]
+    if: endsWith(github.event.repository.name, '-service')
+    uses: ./.github/workflows/be-deploy.yml
+    with:
+      project: ${{ inputs.project }}
+      branch_name: ${{ inputs.branch_name }}
+      github_env: ${{ needs.determine-env.outputs.github_env }}
+    secrets:
+      client_id: ${{ secrets[needs.get-secrets.outputs.client_id_secret] }}
+      tenant_id: ${{ secrets[needs.get-secrets.outputs.tenant_id_secret] }}
+      subscription_id: ${{ secrets[needs.get-secrets.outputs.subscription_id_secret] }}
+      shared_env_subscription_id: ${{ secrets[needs.get-secrets.outputs.shared_env_subscription_id_secret] }}
+      azure_mssql_connection_string: ${{ secrets.AZURE_MSSQL_CONNECTION_STRING }}
+      azure_datalake_connection_string: ${{ secrets.AZURE_DATALAKE_CONNECTION_STRING }}
+
+
+## todo, should just same with dev, and get github_env from needs.get-secrets.outputs.github_env
+#  main:
+#    name: "Deploying to Production"
+#    if: ${{ startsWith(inputs.branch_name, 'main') }}
+#    uses: ./.github/workflows/be-deploy.yml
+#    with:
+#      project: ${{  inputs.project }}
+#      branch_name: ${{  inputs.branch_name }}
+#      github_env: 'prod'
+#    secrets:
+#      client_id: ${{ secrets.AZURE_OIDC_CLIENTID_DEV }}
+#      tenant_id: ${{ secrets.AZURE_OIDC_TENANTID_DEV }}
+#      subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+#      shared_env_subscription_id: ${{ secrets.AZURE_SHARED_SUBSCRIPTION_ID_SDC }}
